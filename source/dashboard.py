@@ -2,8 +2,18 @@
 """
 Cross-platform local dashboard (Windows & Ubuntu)
 Run:  python dashboard.py  (or)  python3 dashboard.py
-Then open http://localhost:5000
-Optional env:
+Then open http://localhost:5000  (or the port you set)
+
+Config file (JSON) supports:
+{
+  "server": { "port": 8080, "title": "My Ops Screen" },
+  "hosts": ["8.8.8.8", "1.1.1.1"],
+  "http_checks": [
+    { "name": "Router UI", "url": "https://192.168.1.1", "verify": false }
+  ]
+}
+
+Env overrides (optional):
   DASHBOARD_PORT=8080
   DASHBOARD_TITLE="My Ops Screen"
   DASHBOARD_CONFIG="path/to/dashboard_config.json"
@@ -13,11 +23,11 @@ from __future__ import annotations
 import os
 import time
 import json
-import math
 import socket
 import platform
 from datetime import datetime
 from threading import Lock
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string
 import psutil
@@ -32,19 +42,23 @@ try:
 except Exception:
     requests = None
 
-APP_TITLE = os.getenv("DASHBOARD_TITLE", "Local System Dashboard")
-CONFIG_PATH = os.getenv("DASHBOARD_CONFIG", "dashboard_config.json")
-PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+# --------- Config & settings (cross-platform) ---------
+# Default: dashboard_config.json next to this script; override with env var
+CONFIG_PATH = os.getenv(
+    "DASHBOARD_CONFIG",
+    str(Path(__file__).with_name("dashboard_config.json"))
+)
 
-# --------- Config loading ---------
 DEFAULT_CONFIG = {
+    "server": {"port": 5000, "title": "Local System Dashboard"},
     "hosts": ["8.8.8.8", "1.1.1.1"],
     "http_checks": [
-        {"name":"Router UI","url":"http://192.168.1.1"}
+        {"name": "Router UI", "url": "http://192.168.1.1"}
     ]
 }
 
 def load_config() -> dict:
+    """Load JSON config; create a default file if missing/invalid."""
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -52,15 +66,63 @@ def load_config() -> dict:
                 raise ValueError("Config must be a JSON object")
             return cfg
     except Exception:
-        # If missing or invalid, write default next to script for convenience
+        # Best-effort write default to the intended location
         try:
+            Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2)
         except Exception:
             pass
         return DEFAULT_CONFIG.copy()
 
-CONFIG = load_config()
+def effective_settings(cfg: dict) -> dict:
+    """Resolve title/port with precedence: config > env > defaults."""
+    server_cfg = (cfg or {}).get("server", {}) if isinstance(cfg, dict) else {}
+    title = server_cfg.get("title") or os.getenv("DASHBOARD_TITLE") or DEFAULT_CONFIG["server"]["title"]
+    port = int(server_cfg.get("port") or os.getenv("DASHBOARD_PORT", DEFAULT_CONFIG["server"]["port"]))
+    return {"title": title, "port": port}
+
+# --------- External IP (cached) ---------
+_ext_cache = {"ts": 0.0, "data": None}
+
+def external_ip_info(ttl_seconds: int = 300):
+    """
+    Try several providers, return {'ip': 'x.x.x.x', 'source': 'url', 'latency_ms': float}
+    Cache result for ttl_seconds. Returns None on failure.
+    """
+    if requests is None:
+        return None
+
+    now = time.time()
+    if _ext_cache["data"] and (now - _ext_cache["ts"] < ttl_seconds):
+        return _ext_cache["data"]
+
+    providers = [
+        ("https://api.ipify.org", {}),
+        ("https://ifconfig.me/ip", {}),
+        ("https://checkip.amazonaws.com", {}),
+    ]
+
+    for url, kwargs in providers:
+        try:
+            t0 = time.perf_counter()
+            r = requests.get(url, timeout=2, **kwargs)
+            dt = (time.perf_counter() - t0) * 1000.0
+            if r.ok and r.text:
+                ip = r.text.strip()
+                # very light sanity check (IPv4/IPv6 chars)
+                if all(c.isdigit() or c in ".:abcdefABCDEF" for c in ip):
+                    data = {"ip": ip, "source": url, "latency_ms": dt}
+                    _ext_cache["ts"] = now
+                    _ext_cache["data"] = data
+                    return data
+        except Exception:
+            continue
+
+    # give up for now
+    _ext_cache["ts"] = now
+    _ext_cache["data"] = None
+    return None
 
 # --------- Net throughput sampling (bytes/sec) ---------
 _net_lock = Lock()
@@ -119,14 +181,16 @@ TEMPLATE = r"""
   <style>
     body { background: #0f172a; color: #e5e7eb; }
     .card { background: #111827; border: 1px solid #1f2937; border-radius: 14px; }
-    .metric { font-size: 1.4rem; font-weight: 600; }
+    .metric { font-size: 1.4rem; font-weight: 600; color: #38bdf8; /* sky-400 */ }
     .muted { color: #9ca3af; }
     .ok { color: #22c55e; }
     .warn { color: #eab308; }
     .bad { color: #ef4444; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .external-ip { color: #ffffff; font-weight: 600; font-size: 1.05rem; }
     a { color: #93c5fd; }
     .small { font-size: 0.9rem; }
+    .host-label { color: #ffffff;   /* bright white for good contrast */ font-weight: 500; /* medium bold so they stand out */ }
   </style>
 </head>
 <body class="container py-4">
@@ -182,7 +246,7 @@ async function refresh() {
         <div class="d-flex justify-content-between">
           <div>
             <div class="muted small">${data.system.platform} • ${data.system.machine}</div>
-            <div class="metric mt-1">${data.system.hostname}</div>
+            <div class="external-ip">${data.system.hostname}</div>
           </div>
           <div class="text-end small muted">
             Python ${data.system.python} <br/>
@@ -191,6 +255,35 @@ async function refresh() {
         </div>
       </div>
     `);
+
+    // Network
+    items.push(`
+      <div class="card p-3">
+        <div class="metric">Network</div>
+        <div class="small muted">Up: ${h(data.net.tx_rate)}/s • Down: ${h(data.net.rx_rate)}/s</div>
+        <div class="small muted">Sent: ${h(data.net.bytes_sent)} • Recv: ${h(data.net.bytes_recv)}</div>
+      </div>
+    `);
+
+    // External IP
+    if (data.external_ip) {
+      const src = data.external_ip.source ? new URL(data.external_ip.source).hostname : "";
+      const latency = data.external_ip.latency_ms ? ` • ${data.external_ip.latency_ms.toFixed(0)} ms` : "";
+      items.push(`
+        <div class="card p-3">
+          <div class="metric">External IP</div>
+          <div class="external-ip">${data.external_ip.ip}</div>
+          <div class="small muted">via ${src}${latency}</div>
+        </div>
+      `);
+    } else {
+      items.push(`
+        <div class="card p-3">
+          <div class="metric">External IP</div>
+          <div class="small muted">unavailable</div>
+        </div>
+      `);
+    }
 
     // CPU / Load
     const load = data.cpu.load ? data.cpu.load.map(x => x.toFixed(2)).join(" | ") : "-";
@@ -217,15 +310,6 @@ async function refresh() {
       </div>
     `);
 
-    // Network
-    items.push(`
-      <div class="card p-3">
-        <div class="metric">Network</div>
-        <div class="small muted">Up: ${h(data.net.tx_rate)}/s • Down: ${h(data.net.rx_rate)}/s</div>
-        <div class="small muted">Sent: ${h(data.net.bytes_sent)} • Recv: ${h(data.net.bytes_recv)}</div>
-      </div>
-    `);
-
     // Temps (if any)
     if (data.temps && data.temps.length) {
       const lines = data.temps.map(t => `<div class="small muted">${t.label}: ${t.current}°C</div>`).join("");
@@ -236,7 +320,7 @@ async function refresh() {
     if (data.pings && data.pings.length) {
       const rows = data.pings.map(p => `
         <div class="d-flex justify-content-between small">
-          <div>${p.host}</div>
+          <div class="host-label">${p.host}</div>
           <div class="${badge(p.ok)}">${p.ok ? (p.avg_ms.toFixed(1) + " ms") : "unreachable"}</div>
         </div>`).join("");
       items.push(`<div class="card p-3"><div class="metric">Pings</div>${rows}</div>`);
@@ -246,7 +330,7 @@ async function refresh() {
     if (data.http_checks && data.http_checks.length) {
       const rows = data.http_checks.map(o => `
         <div class="d-flex justify-content-between small">
-          <div>${o.name || o.url}</div>
+          <div class="host-label">${o.name || o.url}</div>
           <div class="${badge(o.ok, o.status>=400 && o.status<500)}">
             ${o.ok ? (o.status + " • " + o.latency_ms.toFixed(0) + " ms") : "down"}
           </div>
@@ -267,6 +351,7 @@ refresh();
 </html>
 """
 
+# --------- System probes ---------
 def system_info():
     boot_ts = psutil.boot_time()
     info = {
@@ -294,7 +379,7 @@ def mem_info():
 
 def disk_info():
     # Choose root mount sensibly per OS
-    root = "C:\\" if platform.system() == "Windows" else "/"
+    root = "C:\\" if os.name == "nt" else "/"
     du = psutil.disk_usage(root)
     return {"total": du.total, "used": du.used, "percent": du.percent, "mount": root}
 
@@ -324,7 +409,7 @@ def temps_info():
 
 def do_pings(hosts):
     results = []
-    for host in hosts[:10]:  # cap to 10
+    for host in (hosts or [])[:10]:  # cap to 10
         try:
             if ping_host is None:
                 raise RuntimeError("pythonping not installed")
@@ -336,31 +421,36 @@ def do_pings(hosts):
             results.append({"host": host, "ok": False, "avg_ms": None})
     return results
 
-def do_http_checks(items):
+def http_checks_with_verify(items):
     out = []
-    for it in items[:10]:
+    for it in (items or [])[:10]:
         name = it.get("name") or ""
         url = it.get("url")
         if not url:
             continue
+        verify = it.get("verify", True)  # set false for self-signed HTTPS
         try:
             if requests is None:
                 raise RuntimeError("requests not installed")
             t0 = time.perf_counter()
-            resp = requests.get(url, timeout=2)
+            resp = requests.get(url, timeout=2, verify=verify)
             dt = (time.perf_counter() - t0) * 1000.0
             out.append({"name": name, "url": url, "ok": True, "status": resp.status_code, "latency_ms": dt})
         except Exception:
             out.append({"name": name, "url": url, "ok": False, "status": None, "latency_ms": None})
     return out
 
+# --------- Routes ---------
 @app.get("/")
 def index():
-    return render_template_string(TEMPLATE, title=APP_TITLE)
+    cfg = load_config()
+    settings = effective_settings(cfg)
+    return render_template_string(TEMPLATE, title=settings["title"])
 
 @app.get("/api/stats")
 def api_stats():
-    cfg = load_config()  # hot-reload config each request
+    cfg = load_config()  # hot reload on each request
+    settings = effective_settings(cfg)
     data = {
         "now": datetime.utcnow().isoformat() + "Z",
         "system": system_info(),
@@ -370,22 +460,28 @@ def api_stats():
         "net": net_info(),
         "temps": temps_info(),
         "pings": do_pings(cfg.get("hosts", [])),
-        "http_checks": do_http_checks(cfg.get("http_checks", [])),
-        "config": cfg,
+        "http_checks": http_checks_with_verify(cfg.get("http_checks", [])),
+        "external_ip": external_ip_info(),
+        "settings": settings,
+        "config_path": CONFIG_PATH,
     }
     return jsonify(data)
 
+# --------- Entrypoint ---------
 def main():
-    # Prime the net sampler
-    _sample_net()
-    from waitress import serve as waitress_serve  # lightweight prod server, cross-platform
-    print(f"Starting dashboard on port {PORT} ...")
+    _sample_net()  # prime net sampler
+    cfg = load_config()
+    settings = effective_settings(cfg)
+    port = settings["port"]
+
     try:
-        waitress_serve(app, host="0.0.0.0", port=PORT)
+        from waitress import serve as waitress_serve  # lightweight prod server
+        print(f"Starting dashboard on port {port} (config: {CONFIG_PATH}) ...")
+        waitress_serve(app, host="0.0.0.0", port=port)
     except Exception as e:
-        # Fallback to Flask dev server if waitress missing
+        # Fallback to Flask dev server if waitress not available
         print("Waitress not available, using Flask dev server:", e)
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+        app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == "__main__":
     main()
