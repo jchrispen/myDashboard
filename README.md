@@ -32,17 +32,6 @@ Edit `dashboard_config.json` to set hosts to ping and HTTP URLs to check. The ap
 ```bash
 # default port 5000
 python dashboard.py
-
-# customizations
-set DASHBOARD_PORT=8080                 # Windows (cmd)
-$env:DASHBOARD_PORT=8080                # Windows (PowerShell)
-export DASHBOARD_PORT=8080              # Ubuntu
-
-set DASHBOARD_TITLE="Jason's Ops"       # Windows (cmd)
-$env:DASHBOARD_TITLE="Jason's Ops"      # Windows (PowerShell)
-export DASHBOARD_TITLE="Jason's Ops"    # Ubuntu
-
-export DASHBOARD_CONFIG="/path/to/dashboard_config.json"
 ```
 
 Open your browser to `http://localhost:5000`.
