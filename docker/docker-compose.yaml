@@ -1,0 +1,10 @@
+services:
+  dashboard:
+    image: mydashboard:dev
+    container_name: dashboard
+    network_mode: host
+    environment:
+      - DASHBOARD_BRANCH=dev
+    volumes:
+      - /opt/dashboard/config/dashboard_config.json:/config/dashboard_config.json:ro
+    restart: unless-stopped
