@@ -1,4 +1,9 @@
 {
+  "server": {
+    "host":"127.0.0.1",
+    "port": 5000,
+    "title": "My Dashboard"
+  },
   "hosts": [
     "8.8.8.8",
     "1.1.1.1",

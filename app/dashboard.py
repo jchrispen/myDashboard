@@ -12,11 +12,6 @@ Config file (JSON) supports:
     { "name": "Router UI", "url": "https://192.168.1.1", "verify": false }
   ]
 }
-
-Env overrides (optional):
-  DASHBOARD_PORT=8080
-  DASHBOARD_TITLE="My Ops Screen"
-  DASHBOARD_CONFIG="path/to/dashboard_config.json"
 """
 from __future__ import annotations
 
@@ -78,8 +73,8 @@ def load_config() -> dict:
 def effective_settings(cfg: dict) -> dict:
     """Resolve title/port with precedence: config > env > defaults."""
     server_cfg = (cfg or {}).get("server", {}) if isinstance(cfg, dict) else {}
-    title = server_cfg.get("title") or os.getenv("DASHBOARD_TITLE") or DEFAULT_CONFIG["server"]["title"]
-    port = int(server_cfg.get("port") or os.getenv("DASHBOARD_PORT", DEFAULT_CONFIG["server"]["port"]))
+    title = server_cfg.get("title") or DEFAULT_CONFIG["server"]["title"]
+    port = int(server_cfg.get("port"), DEFAULT_CONFIG["server"]["port"])
     return {"title": title, "port": port}
 
 # --------- External IP (cached) ---------
@@ -472,16 +467,17 @@ def main():
     _sample_net()  # prime net sampler
     cfg = load_config()
     settings = effective_settings(cfg)
+    host = settings["host"]
     port = settings["port"]
 
     try:
         from waitress import serve as waitress_serve  # lightweight prod server
         print(f"Starting dashboard on port {port} (config: {CONFIG_PATH}) ...")
-        waitress_serve(app, host="0.0.0.0", port=port)
+        waitress_serve(app, host=host, port=port)
     except Exception as e:
         # Fallback to Flask dev server if waitress not available
         print("Waitress not available, using Flask dev server:", e)
-        app.run(host="0.0.0.0", port=port, debug=False)
+        app.run(host=host, port=port, debug=False)
 
 if __name__ == "__main__":
     main()
