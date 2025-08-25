@@ -74,8 +74,17 @@ def effective_settings(cfg: dict) -> dict:
     """Resolve title/port with precedence: config > env > defaults."""
     server_cfg = (cfg or {}).get("server", {}) if isinstance(cfg, dict) else {}
     title = server_cfg.get("title") or DEFAULT_CONFIG["server"]["title"]
-    port = int(server_cfg.get("port"), DEFAULT_CONFIG["server"]["port"])
-    return {"title": title, "port": port}
+
+    # Grab port from config or default
+    port_val = server_cfg.get("port", DEFAULT_CONFIG["server"]["port"])
+    try:
+        port = int(port_val)
+    except (TypeError, ValueError):
+        port = DEFAULT_CONFIG["server"]["port"]
+
+    host = server_cfg.get("host", "0.0.0.0")  # add this since you use settings["host"] later
+    return {"title": title, "port": port, "host": host}
+
 
 # --------- External IP (cached) ---------
 _ext_cache = {"ts": 0.0, "data": None}
