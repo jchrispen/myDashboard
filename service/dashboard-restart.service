@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart dashboard container
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker compose -f /opt/dashboard/docker/docker-compose.yml restart

@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily restart of dashboard container
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
