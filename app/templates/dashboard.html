@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ title }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { background: #0f172a; color: #e5e7eb; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 14px; }
+    .metric { font-size: 1.4rem; font-weight: 600; color: #38bdf8; }
+    .muted { color: #9ca3af; }
+    .ok { color: #22c55e; }
+    .warn { color: #eab308; }
+    .bad { color: #ef4444; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .external-ip { color: #ffffff; font-weight: 600; font-size: 1.05rem; }
+    .small { font-size: 0.9rem; }
+    .host-label { color: #ffffff; font-weight: 500; }
+    .big-num { font-size: 1rem; font-weight: 500; line-height: 1; color: #22c55e; }
+  </style>
+</head>
+<body class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 m-0">{{ title }}</h1>
+    <div class="d-flex align-items-center gap-2">
+      <button onclick="reloadConfig()" class="btn btn-sm btn-outline-info">Reload Config</button>
+      <div class="small muted" id="now"></div>
+    </div>
+  </div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="my-4">
+    <h5 class="text-info mb-2">System Resource Usage</h5>
+    <canvas id="systemChart" height="100"></canvas>
+  </div>
+
+  <script>
+    // ---- Chart (CPU + Memory), with simplified relative time labels ----
+    const systemData = {
+      labels: [],
+      datasets: [
+        { label: 'CPU Usage %', data: [], borderColor: 'rgb(75, 192, 192)', fill: false, tension: 0.1 },
+        { label: 'Memory Usage %', data: [], borderColor: 'rgb(255, 99, 132)', fill: false, tension: 0.1 }
+      ]
+    };
+    const systemChart = new Chart(document.getElementById('systemChart'), {
+      type: 'line',
+      data: systemData,
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        aspectRatio: 3.5,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            position: 'right',
+            labels: { color: '#9ca3af' }
+          },
+          tooltip: {
+            callbacks: {
+              title(items) { return `${items[0].label} ago`; }
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: {
+              autoSkip: true,
+              maxTicksLimit: 10,
+              color: '#9ca3af'
+            }
+          },
+          y: {
+            beginAtZero: true,
+            max: 100,
+            title: { display: true, text: '% Usage' },
+            ticks: { color: '#9ca3af' }
+          }
+        }
+      }
+    });
+
+    const MAX_POINTS = 30;      // how many samples to keep visible
+    const SAMPLE_SECS = 2;      // refresh cadence (setInterval is 2000 ms)
+
+    function updateSystemChart(cpuPercent, memPercent) {
+      systemData.datasets[0].data.push(cpuPercent);
+      systemData.datasets[1].data.push(memPercent);
+
+      if (systemData.datasets[0].data.length > MAX_POINTS) {
+        systemData.datasets[0].data.shift();
+        systemData.datasets[1].data.shift();
+      }
+
+      const n = systemData.datasets[0].data.length;
+      systemData.labels = Array.from({ length: n }, (_, i) => `${(n - 1 - i) * SAMPLE_SECS}s`);
+
+      systemChart.update();
+    }
+
+    // ---- Helpers ----
+    function h(bytes) {
+      if (bytes === null || bytes === undefined) return "-";
+      const units = ["B","KB","MB","GB","TB","PB"];
+      let i = 0;
+      let n = Number(bytes);
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return n.toFixed(1) + " " + units[i];
+    }
+    function pct(p) { return (p ?? 0).toFixed(0) + "%"; }
+    function fmtUptime(secs) {
+      let s = Math.floor(secs);
+      const d = Math.floor(s / 86400); s -= d*86400;
+      const hhh = Math.floor(s / 3600); s -= hhh*3600;
+      const m = Math.floor(s / 60); s -= m*60;
+      const parts = [];
+      if (d) parts.push(d + "d");
+      if (hhh) parts.push(hhh + "h");
+      if (m) parts.push(m + "m");
+      parts.push(s + "s");
+      return parts.join(" ");
+    }
+    function badge(ok, warn=false) { if (ok) return "ok"; if (warn) return "warn"; return "bad"; }
+    function mbpsLabel(bps) { if (bps == null) return "-"; return (bps / 1e6).toFixed(1) + " Mbps"; }
+
+    // Relative time helper for scheduler timestamps (expects epoch seconds)
+    function relFromNow(tsSec) {
+      if (tsSec == null) return "—";
+      const now = Date.now();
+      const t = tsSec * 1000;
+      const diff = t - now;
+      const past = diff <= 0;
+      const secs = Math.abs(diff) / 1000;
+
+      const pick = (n, u) => `${Math.round(n)}${u}`;
+      let span;
+      if (secs < 60) span = pick(secs, "s");
+      else if (secs < 3600) span = pick(secs / 60, "m");
+      else if (secs < 86400) span = pick(secs / 3600, "h");
+      else span = pick(secs / 86400, "d");
+
+      return past ? `${span} ago` : `in ${span}`;
+    }
+
+    async function reloadConfig() {
+      const r = await fetch("/api/reload", { method: "POST" });
+      const data = await r.json();
+      alert(data.message);
+      refresh();
+    }
+
+    async function startSpeedtest() {
+      try { await fetch("/api/speedtest/start", { method: "POST" }); }
+      catch (e) { console.error(e); }
+      refresh();
+    }
+
+    // ---- Main refresh ----
+    async function refresh() {
+      try {
+        const [statsRes, stRes] = await Promise.all([
+          fetch("/api/stats"),
+          fetch("/api/speedtest/status")
+        ]);
+        const data = await statsRes.json();
+        const speed = await stRes.json();
+
+        const grid = document.getElementById("cards");
+        document.getElementById("now").innerText = new Date(data.now).toLocaleString();
+
+        updateSystemChart(data.cpu.total, data.memory.percent);
+
+        const items = [];
+
+        // System card
+        items.push(`
+          <div class="card p-3">
+            <div class="metric">${data.system.hostname}</div>
+            <div class="muted small mt-1">
+              ${data.system.platform} • ${data.system.machine} <br/>
+              Python ${data.system.python} <br/>
+              <div class="mt-1">Uptime ${fmtUptime(data.system.uptime_s)}</div>
+            </div>
+          </div>
+        `);
+
+        // Build interface list (lives in Addressing card)
+        let ifaceLines = '';
+        if (data.net.interfaces) {
+          const entries = Object.entries(data.net.interfaces).filter(([name, ips]) => ips.length > 0);
+          if (entries.length > 0) {
+            ifaceLines += `<div class="small muted mt-2">`;
+            for (const [iface, ips] of entries) {
+              ifaceLines += `
+                <div class="small">
+                  <span class="muted">${iface} →</span>
+                  <span class="ok">${ips.join(", ")}</span>
+                </div>`;
+            }
+            ifaceLines += `</div>`;
+          }
+        }
+
+        // Network card: real-time NIC rates + Speedtest
+        let stContent = '';
+        if (speed.running) {
+          stContent = `<div class="small muted mt-2">Internet Speed Test: running…</div>`;
+        } else if (speed.error) {
+          stContent = `<div class="small bad mt-2">Speedtest error: ${speed.error}</div>`;
+        } else if (speed.result) {
+          const r = speed.result;
+          const server = r.server ? `${r.server.sponsor} — ${r.server.name} (${r.server.country})` : "";
+          stContent = `
+            <div class="d-flex gap-4 align-items-center mt-2">
+              <div>
+                <div class="small muted">Download</div>
+                <div class="big-num">${mbpsLabel(r.download_bps)}</div>
+              </div>
+              <div>
+                <div class="small muted">Upload</div>
+                <div class="big-num">${mbpsLabel(r.upload_bps)}</div>
+              </div>
+              <div>
+                <div class="small muted">Ping</div>
+                <div class="big-num">${r.ping_ms != null ? r.ping_ms.toFixed(0) + " ms" : "-"}</div>
+              </div>
+            </div>
+            <div class="small muted mt-1">${server}</div>
+          `;
+        } else {
+          stContent = `<div class="small muted mt-2">Internet Speed Test: idle</div>`;
+        }
+
+        // Append schedule line (works whether schedule exists or not)
+        const sched = (speed && speed.schedule) || {};
+        const schedLine = (typeof sched.enabled === "boolean")
+          ? (sched.enabled
+              ? `<div class="small muted mt-1">Auto: every ${sched.interval_minutes}m • Last: ${relFromNow(sched.last_run_ts)} • Next: ${relFromNow(sched.next_run_ts)}</div>`
+              : `<div class="small muted mt-1">Auto: off</div>`)
+          : ``;
+        stContent += schedLine;
+
+        const stBtnDisabled = speed.running ? "disabled" : "";
+        items.push(`
+          <div class="card p-3">
+            <div class="d-flex justify-content-between align-items-center">
+              <div class="metric">Network</div>
+              <button class="btn btn-sm btn-outline-light" ${stBtnDisabled} onclick="startSpeedtest()">Run Now</button>
+            </div>
+            <div class="small mt-1">
+              <span class="muted">Up:</span> <span class="ok">${h(data.net.tx_rate)}/s</span>
+              <span class="muted"> • Down:</span> <span class="ok">${h(data.net.rx_rate)}/s</span>
+            </div>
+            <div class="small">
+              <span class="muted">Sent:</span> <span class="ok">${h(data.net.bytes_sent)}</span>
+              <span class="muted"> • Recv:</span> <span class="ok">${h(data.net.bytes_recv)}</span>
+            </div>
+            ${stContent}
+          </div>
+        `);
+
+        // Addressing
+        if (data.external_ip) {
+          const src = data.external_ip.source ? new URL(data.external_ip.source).hostname : "";
+          const latency = data.external_ip.latency_ms ? ` • ${data.external_ip.latency_ms.toFixed(0)} ms` : "";
+          items.push(`
+            <div class="card p-3">
+              <div class="metric">Addressing</div>
+              <div class="muted">
+                <span class="muted">WAN → </span><span class="big-num">${data.external_ip.ip}</span>
+              </div>
+              <div class="small muted">via ${src}${latency}</div>
+              ${ifaceLines}
+            </div>
+          `);
+        } else {
+          items.push(`
+            <div class="card p-3">
+              <div class="metric">Addressing</div>
+              <div class="small muted">unavailable</div>
+              ${ifaceLines}
+            </div>
+          `);
+        }
+
+        // Pings
+        if (data.pings && data.pings.length) {
+          const sorted = [...data.pings].sort((a, b) => {
+            const av = a.ok ? (a.avg_ms ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+            const bv = b.ok ? (b.avg_ms ?? Number.POSITIVE_INFINITY) : Number.POSITIVE_INFINITY;
+            return av - bv;
+          });
+
+          const rows = sorted.map(p => {
+            const cls = p.ok
+              ? (p.avg_ms < 40 ? 'ok' : (p.avg_ms < 120 ? 'warn' : 'bad'))
+              : 'bad';
+            const value = p.ok && p.avg_ms != null ? `${Math.round(p.avg_ms)} ms` : "unreachable";
+            return `
+              <div class="d-flex justify-content-between small">
+                <div class="host-label">${p.resolved} (${p.host})</div>
+                <div class="${cls}">${value}</div>
+              </div>`;
+          }).join("");
+
+          items.push(`<div class="card p-3"><div class="metric">Pings</div>${rows}</div>`);
+        }
+
+        // CPU
+        const load = data.cpu.load ? data.cpu.load.map(x => x.toFixed(2)).join(" | ") : "-";
+        items.push(`
+          <div class="card p-3">
+            <div class="metric">CPU ${pct(data.cpu.total)}</div>
+            <div class="small muted">Cores: ${data.cpu.cores} • Load: ${load}</div>
+          </div>
+        `);
+
+        // Memory
+        items.push(`
+          <div class="card p-3">
+            <div class="metric">Memory ${pct(data.memory.percent)}</div>
+            <div class="small muted">${h(data.memory.used)} / ${h(data.memory.total)}</div>
+          </div>
+        `);
+
+        // Disk
+        items.push(`
+          <div class="card p-3">
+            <div class="metric">Disk ${pct(data.disk.percent)}</div>
+            <div class="small muted">${h(data.disk.used)} / ${h(data.disk.total)} (${data.disk.mount})</div>
+          </div>
+        `);
+
+        // Temps
+        if (data.temps && data.temps.length) {
+          const lines = data.temps.map(t => `<div class="small muted">${t.label}: ${t.current}°C</div>`).join("");
+          items.push(`<div class="card p-3"><div class="metric">Temperatures</div>${lines}</div>`);
+        }
+
+        // HTTP checks
+        if (data.http_checks && data.http_checks.length) {
+          const rows = data.http_checks.map(o => `
+            <div class="d-flex justify-content-between small">
+              <div class="host-label">${o.name || o.url}</div>
+              <div class="${badge(o.ok, o.status>=400 && o.status<500)}">
+                ${o.ok ? (o.status + " • " + o.latency_ms.toFixed(0) + " ms") : "down"}
+              </div>
+            </div>`).join("");
+          items.push(`<div class="card p-3"><div class="metric">HTTP</div>${rows}</div>`);
+        }
+
+        grid.innerHTML = items.join("");
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    setInterval(refresh, 2000);
+    refresh();
+  </script>
+</body>
+</html>

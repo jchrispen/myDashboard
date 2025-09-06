@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
-"""
-Cross-platform local dashboard (Windows & Ubuntu)
-Run:  python dashboard.py  (or)  python3 dashboard.py
-Then open http://localhost:5000  (or the port you set)
-
-Config file (JSON) supports:
-{
-  "server": { "port": 8080, "title": "My Ops Screen" },
-  "hosts": ["8.8.8.8", "1.1.1.1"],
-  "http_checks": [
-    { "name": "Router UI", "url": "https://192.168.1.1", "verify": false }
-  ]
-}
-"""
-from __future__ import annotations
-
+import re
 import os
 import time
 import json
 import socket
 import platform
-from datetime import datetime
-from threading import Lock
+import logging
+from datetime import datetime, UTC
+from threading import Lock, Thread
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template, request
 import psutil
 
+# Optional imports
 try:
     from pythonping import ping as ping_host
 except Exception:
@@ -37,76 +24,85 @@ try:
 except Exception:
     requests = None
 
-# --------- Config & settings (cross-platform) ---------
-# Default: dashboard_config.json next to this script; override with env var
+try:
+    import speedtest as speedtest_lib  # pip install speedtest-cli
+except Exception:
+    speedtest_lib = None
+
+# --------- Logging setup ---------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# --------- Config & settings ---------
 CONFIG_PATH = os.getenv(
     "DASHBOARD_CONFIG",
     str(Path(__file__).with_name("dashboard_config.json"))
 )
 
 DEFAULT_CONFIG = {
-    "server": {"port": 5000, "title": "Local System Dashboard"},
+    "server": {"port": 5000, "title": "Local System Dashboard", "host": "0.0.0.0"},
     "hosts": ["8.8.8.8", "1.1.1.1"],
     "http_checks": [
         {"name": "Router UI", "url": "http://192.168.1.1"}
     ]
 }
 
+DEFAULT_CONFIG.update({
+    "speedtest": {
+        "enabled": True,               # turn background runs on/off
+        "interval_minutes": 30,        # how often to run when healthy
+        "run_at_startup": True,        # kick off one soon after boot
+        "start_delay_sec": 5,          # wait this many seconds after boot
+        "backoff_minutes_on_error": 10 # if a run fails, try again later
+    }
+})
+
 def load_config() -> dict:
-    """Load JSON config; create a default file if missing/invalid."""
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
             if not isinstance(cfg, dict):
                 raise ValueError("Config must be a JSON object")
             return cfg
-    except Exception:
-        # Best-effort write default to the intended location
+    except Exception as e:
+        logging.warning(f"Failed to load config: {e}")
         try:
             Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(DEFAULT_CONFIG, f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to write default config: {e}")
         return DEFAULT_CONFIG.copy()
 
 def effective_settings(cfg: dict) -> dict:
-    """Resolve title/port with precedence: config > env > defaults."""
     server_cfg = (cfg or {}).get("server", {}) if isinstance(cfg, dict) else {}
     title = server_cfg.get("title") or DEFAULT_CONFIG["server"]["title"]
-
-    # Grab port from config or default
     port_val = server_cfg.get("port", DEFAULT_CONFIG["server"]["port"])
     try:
         port = int(port_val)
     except (TypeError, ValueError):
         port = DEFAULT_CONFIG["server"]["port"]
-
-    host = server_cfg.get("host", "0.0.0.0")  # add this since you use settings["host"] later
+    host = server_cfg.get("host", "0.0.0.0")
     return {"title": title, "port": port, "host": host}
 
-
-# --------- External IP (cached) ---------
+# --------- Caching & Networking ---------
 _ext_cache = {"ts": 0.0, "data": None}
+_net_lock = Lock()
+_last_net = {"ts": None, "bytes_sent": 0, "bytes_recv": 0, "tx_rate": 0.0, "rx_rate": 0.0}
 
 def external_ip_info(ttl_seconds: int = 300):
-    """
-    Try several providers, return {'ip': 'x.x.x.x', 'source': 'url', 'latency_ms': float}
-    Cache result for ttl_seconds. Returns None on failure.
-    """
     if requests is None:
         return None
-
     now = time.time()
     if _ext_cache["data"] and (now - _ext_cache["ts"] < ttl_seconds):
         return _ext_cache["data"]
-
     providers = [
         ("https://api.ipify.org", {}),
         ("https://ifconfig.me/ip", {}),
         ("https://checkip.amazonaws.com", {}),
     ]
-
     for url, kwargs in providers:
         try:
             t0 = time.perf_counter()
@@ -114,7 +110,6 @@ def external_ip_info(ttl_seconds: int = 300):
             dt = (time.perf_counter() - t0) * 1000.0
             if r.ok and r.text:
                 ip = r.text.strip()
-                # very light sanity check (IPv4/IPv6 chars)
                 if all(c.isdigit() or c in ".:abcdefABCDEF" for c in ip):
                     data = {"ip": ip, "source": url, "latency_ms": dt}
                     _ext_cache["ts"] = now
@@ -122,15 +117,9 @@ def external_ip_info(ttl_seconds: int = 300):
                     return data
         except Exception:
             continue
-
-    # give up for now
     _ext_cache["ts"] = now
     _ext_cache["data"] = None
     return None
-
-# --------- Net throughput sampling (bytes/sec) ---------
-_net_lock = Lock()
-_last_net = {"ts": None, "bytes_sent": 0, "bytes_recv": 0, "tx_rate": 0.0, "rx_rate": 0.0}
 
 def _sample_net():
     with _net_lock:
@@ -150,227 +139,20 @@ def get_net_rates():
     with _net_lock:
         return _last_net["tx_rate"], _last_net["rx_rate"]
 
-# --------- Helpers ---------
-def bytes2human(n: float) -> str:
-    symbols = ("B", "KB", "MB", "GB", "TB", "PB")
-    i = 0
-    while n >= 1024.0 and i < len(symbols) - 1:
-        n /= 1024.0
-        i += 1
-    return f"{n:.1f} {symbols[i]}"
-
-def seconds2human(s: float) -> str:
-    s = int(s)
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    if m: parts.append(f"{m}m")
-    parts.append(f"{s}s")
-    return " ".join(parts)
-
-# --------- Flask app ---------
-app = Flask(__name__)
-
-TEMPLATE = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title }}</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    body { background: #0f172a; color: #e5e7eb; }
-    .card { background: #111827; border: 1px solid #1f2937; border-radius: 14px; }
-    .metric { font-size: 1.4rem; font-weight: 600; color: #38bdf8; /* sky-400 */ }
-    .muted { color: #9ca3af; }
-    .ok { color: #22c55e; }
-    .warn { color: #eab308; }
-    .bad { color: #ef4444; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-    .external-ip { color: #ffffff; font-weight: 600; font-size: 1.05rem; }
-    a { color: #93c5fd; }
-    .small { font-size: 0.9rem; }
-    .host-label { color: #ffffff;   /* bright white for good contrast */ font-weight: 500; /* medium bold so they stand out */ }
-  </style>
-</head>
-<body class="container py-4">
-  <div class="d-flex justify-content-between align-items-center mb-3">
-    <h1 class="h3 m-0">{{ title }}</h1>
-    <div class="small muted" id="now"></div>
-  </div>
-
-  <div class="grid" id="cards">
-    <!-- Cards are injected by JS -->
-  </div>
-
-<script>
-function h(bytes) {
-  if (bytes === null || bytes === undefined) return "-";
-  const units = ["B","KB","MB","GB","TB","PB"];
-  let i = 0;
-  let n = Number(bytes);
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return n.toFixed(1) + " " + units[i];
-}
-function pct(p) { return (p ?? 0).toFixed(0) + "%"; }
-function fmtUptime(secs) {
-  let s = Math.floor(secs);
-  const d = Math.floor(s / 86400); s -= d*86400;
-  const h = Math.floor(s / 3600); s -= h*3600;
-  const m = Math.floor(s / 60); s -= m*60;
-  const parts = [];
-  if (d) parts.push(d + "d");
-  if (h) parts.push(h + "h");
-  if (m) parts.push(m + "m");
-  parts.push(s + "s");
-  return parts.join(" ");
-}
-function badge(ok, warn=false) {
-  if (ok) return "ok";
-  if (warn) return "warn";
-  return "bad";
-}
-
-async function refresh() {
-  try {
-    const r = await fetch("/api/stats");
-    const data = await r.json();
-    const grid = document.getElementById("cards");
-    document.getElementById("now").innerText = new Date(data.now).toLocaleString();
-
-    const items = [];
-
-    // System
-    items.push(`
-      <div class="card p-3">
-        <div class="d-flex justify-content-between">
-          <div>
-            <div class="muted small">${data.system.platform} • ${data.system.machine}</div>
-            <div class="external-ip">${data.system.hostname}</div>
-          </div>
-          <div class="text-end small muted">
-            Python ${data.system.python} <br/>
-            Uptime ${fmtUptime(data.system.uptime_s)}
-          </div>
-        </div>
-      </div>
-    `);
-
-    // Network
-    items.push(`
-      <div class="card p-3">
-        <div class="metric">Network</div>
-        <div class="small muted">Up: ${h(data.net.tx_rate)}/s • Down: ${h(data.net.rx_rate)}/s</div>
-        <div class="small muted">Sent: ${h(data.net.bytes_sent)} • Recv: ${h(data.net.bytes_recv)}</div>
-      </div>
-    `);
-
-    // External IP
-    if (data.external_ip) {
-      const src = data.external_ip.source ? new URL(data.external_ip.source).hostname : "";
-      const latency = data.external_ip.latency_ms ? ` • ${data.external_ip.latency_ms.toFixed(0)} ms` : "";
-      items.push(`
-        <div class="card p-3">
-          <div class="metric">External IP</div>
-          <div class="external-ip">${data.external_ip.ip}</div>
-          <div class="small muted">via ${src}${latency}</div>
-        </div>
-      `);
-    } else {
-      items.push(`
-        <div class="card p-3">
-          <div class="metric">External IP</div>
-          <div class="small muted">unavailable</div>
-        </div>
-      `);
-    }
-
-    // CPU / Load
-    const load = data.cpu.load ? data.cpu.load.map(x => x.toFixed(2)).join(" | ") : "-";
-    items.push(`
-      <div class="card p-3">
-        <div class="metric">CPU ${pct(data.cpu.total)}</div>
-        <div class="small muted">Cores: ${data.cpu.cores} • Load: ${load}</div>
-      </div>
-    `);
-
-    // Memory
-    items.push(`
-      <div class="card p-3">
-        <div class="metric">Memory ${pct(data.memory.percent)}</div>
-        <div class="small muted">${h(data.memory.used)} / ${h(data.memory.total)}</div>
-      </div>
-    `);
-
-    // Disk (root)
-    items.push(`
-      <div class="card p-3">
-        <div class="metric">Disk ${pct(data.disk.percent)}</div>
-        <div class="small muted">${h(data.disk.used)} / ${h(data.disk.total)} (${data.disk.mount})</div>
-      </div>
-    `);
-
-    // Temps (if any)
-    if (data.temps && data.temps.length) {
-      const lines = data.temps.map(t => `<div class="small muted">${t.label}: ${t.current}°C</div>`).join("");
-      items.push(`<div class="card p-3"><div class="metric">Temperatures</div>${lines}</div>`);
-    }
-
-    // Pings
-    if (data.pings && data.pings.length) {
-      const rows = data.pings.map(p => `
-        <div class="d-flex justify-content-between small">
-          <div class="host-label">${p.host}</div>
-          <div class="${badge(p.ok)}">${p.ok ? (p.avg_ms.toFixed(1) + " ms") : "unreachable"}</div>
-        </div>`).join("");
-      items.push(`<div class="card p-3"><div class="metric">Pings</div>${rows}</div>`);
-    }
-
-    // HTTP checks
-    if (data.http_checks && data.http_checks.length) {
-      const rows = data.http_checks.map(o => `
-        <div class="d-flex justify-content-between small">
-          <div class="host-label">${o.name || o.url}</div>
-          <div class="${badge(o.ok, o.status>=400 && o.status<500)}">
-            ${o.ok ? (o.status + " • " + o.latency_ms.toFixed(0) + " ms") : "down"}
-          </div>
-        </div>`).join("");
-      items.push(`<div class="card p-3"><div class="metric">HTTP</div>${rows}</div>`);
-    }
-
-    grid.innerHTML = items.join("");
-  } catch (e) {
-    console.error(e);
-  }
-}
-
-setInterval(refresh, 2000);
-refresh();
-</script>
-</body>
-</html>
-"""
-
-# --------- System probes ---------
+# --------- System Info ---------
 def system_info():
     boot_ts = psutil.boot_time()
-    info = {
+    return {
         "hostname": socket.gethostname(),
         "platform": f"{platform.system()} {platform.release()}",
         "machine": platform.machine(),
         "python": platform.python_version(),
         "uptime_s": max(0, time.time() - boot_ts),
     }
-    return info
 
 def cpu_info():
     total = psutil.cpu_percent(interval=0.2)
     cores = psutil.cpu_count(logical=True)
-    # Load average not available on Windows
     try:
         load = list(os.getloadavg())
     except (AttributeError, OSError):
@@ -382,19 +164,50 @@ def mem_info():
     return {"total": vm.total, "used": vm.used, "percent": vm.percent}
 
 def disk_info():
-    # Choose root mount sensibly per OS
     root = "C:\\" if os.name == "nt" else "/"
     du = psutil.disk_usage(root)
     return {"total": du.total, "used": du.used, "percent": du.percent, "mount": root}
 
+def simplify_iface_name(name: str) -> str:
+    if "Loopback" in name:
+        return "Loopback"
+    elif name.startswith("Wi-Fi"):
+        return "WiFi"
+    elif name.startswith("Ethernet"):
+        return name
+    elif name.startswith("Local Area Connection"):
+        match = re.search(r'\d+', name)
+        return f"LAC {match.group()}" if match else "LAC"
+    elif name.startswith("vEthernet (Default Switch)"):
+        return "vSwitch: Default"
+    elif "WSL" in name:
+        return "vSwitch: WSL"
+    else:
+        return name
+
 def net_info():
     tx_rate, rx_rate = get_net_rates()
     io = psutil.net_io_counters()
+
+    interfaces = {}
+    try:
+        for name, addrs in psutil.net_if_addrs().items():
+            ipv4_list = []
+            for a in addrs:
+                if a.family == socket.AF_INET and not a.address.startswith("169.254."):
+                    ipv4_list.append(a.address)
+            if ipv4_list:
+                friendly = simplify_iface_name(name)
+                interfaces[friendly] = ipv4_list
+    except Exception as e:
+        logging.warning("Failed to retrieve interface IPs: %s", e)
+
     return {
         "tx_rate": tx_rate,
         "rx_rate": rx_rate,
         "bytes_sent": io.bytes_sent,
         "bytes_recv": io.bytes_recv,
+        "interfaces": interfaces
     }
 
 def temps_info():
@@ -413,16 +226,23 @@ def temps_info():
 
 def do_pings(hosts):
     results = []
-    for host in (hosts or [])[:10]:  # cap to 10
+    for host in (hosts or [])[:10]:
         try:
             if ping_host is None:
                 raise RuntimeError("pythonping not installed")
             r = ping_host(host, size=16, count=2, timeout=1)
             ok = r.success()
             avg_ms = r.rtt_avg_ms if hasattr(r, "rtt_avg_ms") else None
-            results.append({"host": host, "ok": bool(ok), "avg_ms": float(avg_ms) if avg_ms is not None else None})
+            try:
+                resolved = socket.gethostbyaddr(host)[0]
+            except Exception:
+                resolved = host
+            results.append({
+                "host": host, "resolved": resolved, "ok": bool(ok),
+                "avg_ms": float(avg_ms) if avg_ms is not None else None
+            })
         except Exception:
-            results.append({"host": host, "ok": False, "avg_ms": None})
+            results.append({"host": host, "resolved": host, "ok": False, "avg_ms": None})
     return results
 
 def http_checks_with_verify(items):
@@ -432,7 +252,7 @@ def http_checks_with_verify(items):
         url = it.get("url")
         if not url:
             continue
-        verify = it.get("verify", True)  # set false for self-signed HTTPS
+        verify = it.get("verify", True)
         try:
             if requests is None:
                 raise RuntimeError("requests not installed")
@@ -444,19 +264,161 @@ def http_checks_with_verify(items):
             out.append({"name": name, "url": url, "ok": False, "status": None, "latency_ms": None})
     return out
 
-# --------- Routes ---------
+# --------- Speedtest state & worker ---------
+_speed_lock = Lock()
+_speed_state = {
+    "running": False,
+    "started_ts": None,
+    "result": None,     # dict with download_bps, upload_bps, ping_ms, server
+    "error": None
+}
+
+_sched_lock = Lock()
+_sched_state = {
+    "enabled": False,
+    "interval_s": 1800,
+    "last_run_ts": None,   # epoch seconds
+    "next_run_ts": None,   # epoch seconds
+    "run_count": 0,
+    "last_error": None,
+}
+
+def _speedtest_cfg_from(cfg: dict):
+    st = (cfg or {}).get("speedtest", {}) or {}
+    enabled = bool(st.get("enabled", True))
+    interval_minutes = int(st.get("interval_minutes", 30))
+    interval_s = max(60, interval_minutes * 60)
+    run_at_startup = bool(st.get("run_at_startup", True))
+    start_delay_sec = int(st.get("start_delay_sec", 5))
+    backoff_minutes = int(st.get("backoff_minutes_on_error", 10))
+    backoff_s = max(60, backoff_minutes * 60)
+    return enabled, interval_s, run_at_startup, start_delay_sec, backoff_s
+
+def _speedtest_scheduler():
+    """Background loop that runs speed tests on a schedule."""
+    # Defer a moment so waitress/flask can initialize cleanly
+    time.sleep(0.5)
+
+    # Seed next_run based on config
+    while True:
+        try:
+            cfg = load_config()
+            enabled, interval_s, run_at_startup, start_delay, backoff_s = _speedtest_cfg_from(cfg)
+            now = time.time()
+
+            with _sched_lock:
+                _sched_state["enabled"] = enabled
+                _sched_state["interval_s"] = interval_s
+
+            if not enabled:
+                with _sched_lock:
+                    _sched_state["next_run_ts"] = None
+                time.sleep(2)
+                continue
+
+            # Figure out last and next timestamps
+            with _speed_lock:
+                running = _speed_state["running"]
+                last_res = _speed_state.get("result") or {}
+                last_err = _speed_state.get("error")
+
+            last_ts = last_res.get("finished_ts") or _sched_state.get("last_run_ts")
+
+            if running:
+                # Conservative next-run estimate while one is in-flight
+                with _sched_lock:
+                    if last_ts:
+                        _sched_state["next_run_ts"] = last_ts + interval_s
+                time.sleep(2)
+                continue
+
+            # Decide if we're due
+            if last_ts is None:
+                # First run since boot
+                due_ts = now + max(0, start_delay) if run_at_startup else now + interval_s
+            else:
+                due_ts = last_ts + interval_s
+
+            with _sched_lock:
+                _sched_state["next_run_ts"] = due_ts
+
+            if now < due_ts:
+                # Sleep until (roughly) due
+                time.sleep(min(2, max(0.2, due_ts - now)))
+                continue
+
+            # Run a test (synchronously in this thread to keep logic simple)
+            with _speed_lock:
+                if _speed_state["running"]:
+                    time.sleep(2)
+                    continue
+
+            _run_speedtest()
+
+            # Inspect outcome and set next run
+            with _speed_lock:
+                err = _speed_state.get("error")
+
+            now = time.time()
+            with _sched_lock:
+                _sched_state["last_run_ts"] = now
+                _sched_state["run_count"] += 1
+                _sched_state["last_error"] = err
+                _sched_state["next_run_ts"] = now + (backoff_s if err else interval_s)
+
+            time.sleep(1)
+
+        except Exception as e:
+            logging.exception("Speedtest scheduler error: %s", e)
+            time.sleep(5)
+
+def _run_speedtest():
+    with _speed_lock:
+        _speed_state.update(running=True, started_ts=time.time(), result=None, error=None)
+    try:
+        if speedtest_lib is None:
+            raise RuntimeError("speedtest-cli not installed. Run: pip install speedtest-cli")
+        st = speedtest_lib.Speedtest(secure=True)
+        st.get_servers([])
+        best = st.get_best_server()
+        # Download/Upload return bits per second
+        download_bps = st.download(threads=None)
+        upload_bps = st.upload(threads=None)
+        ping_ms = st.results.ping
+        server = {
+            "sponsor": best.get("sponsor"),
+            "name": best.get("name"),
+            "country": best.get("country")
+        }
+        result = {
+            "download_bps": float(download_bps),
+            "upload_bps": float(upload_bps),
+            "ping_ms": float(ping_ms) if ping_ms is not None else None,
+            "server": server,
+            "finished_ts": time.time()
+        }
+        with _speed_lock:
+            _speed_state.update(running=False, result=result, error=None)
+    except Exception as e:
+        logging.warning("Speedtest failed: %s", e)
+        with _speed_lock:
+            _speed_state.update(running=False, error=str(e), result=None)
+
+# --------- Flask App ---------
+app = Flask(__name__)
+
 @app.get("/")
 def index():
     cfg = load_config()
     settings = effective_settings(cfg)
-    return render_template_string(TEMPLATE, title=settings["title"])
+    return render_template("dashboard.html", title=settings["title"])
 
 @app.get("/api/stats")
 def api_stats():
-    cfg = load_config()  # hot reload on each request
+    cfg = load_config()
     settings = effective_settings(cfg)
     data = {
-        "now": datetime.utcnow().isoformat() + "Z",
+        "now": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "system": system_info(),
         "cpu": cpu_info(),
         "memory": mem_info(),
@@ -471,21 +433,56 @@ def api_stats():
     }
     return jsonify(data)
 
+@app.post("/api/reload")
+def reload_config():
+    global _ext_cache
+    _ext_cache = {"ts": 0.0, "data": None}
+    logging.info("Configuration reloaded via API.")
+    return jsonify({"status": "ok", "message": "Configuration reloaded."})
+
+# ---- Speedtest endpoints ----
+@app.post("/api/speedtest/start")
+def speedtest_start():
+    with _speed_lock:
+        if _speed_state["running"]:
+            return jsonify({"status": "already-running"}), 200
+        _speed_state.update(running=True, started_ts=time.time(), result=None, error=None)
+    t = Thread(target=_run_speedtest, daemon=True)
+    t.start()
+    return jsonify({"status": "started"}), 202
+
+@app.get("/api/speedtest/status")
+def speedtest_status():
+    with _speed_lock:
+        payload = dict(_speed_state)
+    with _sched_lock:
+        payload["schedule"] = {
+            "enabled": _sched_state["enabled"],
+            "interval_minutes": int(round(_sched_state["interval_s"] / 60)),
+            "last_run_ts": _sched_state["last_run_ts"],
+            "next_run_ts": _sched_state["next_run_ts"],
+            "run_count": _sched_state["run_count"],
+            "last_error": _sched_state["last_error"],
+        }
+    return jsonify(payload)
+
 # --------- Entrypoint ---------
 def main():
-    _sample_net()  # prime net sampler
+    _sample_net()
     cfg = load_config()
     settings = effective_settings(cfg)
     host = settings["host"]
     port = settings["port"]
 
+    # 🔸 start the background speedtest scheduler
+    Thread(target=_speedtest_scheduler, daemon=True).start()
+
     try:
-        from waitress import serve as waitress_serve  # lightweight prod server
-        print(f"Starting dashboard on port {port} (config: {CONFIG_PATH}) ...")
+        from waitress import serve as waitress_serve
+        logging.info(f"Starting dashboard on port {port} (config: {CONFIG_PATH}) ...")
         waitress_serve(app, host=host, port=port)
     except Exception as e:
-        # Fallback to Flask dev server if waitress not available
-        print("Waitress not available, using Flask dev server:", e)
+        logging.warning("Waitress not available, using Flask dev server: %s", e)
         app.run(host=host, port=port, debug=False)
 
 if __name__ == "__main__":
